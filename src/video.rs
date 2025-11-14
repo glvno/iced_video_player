@@ -233,14 +233,7 @@ impl Video {
     pub fn new(uri: &url::Url) -> Result<Self, Error> {
         gst::init()?;
 
-        // GStreamer pipeline optimized for NV12 output
-        // - playbin: handles decoding and format negotiation
-        // - videoscale: handles resolution adjustments
-        // - videoconvert: converts decoded video to NV12
-        // - appsink: receives NV12 frames
-        // NOTE: Not using capsfilter with strict format=NV12 because it can cause negotiation failures
-        // with certain decoders. Instead, we rely on videoconvert's default NV12 output.
-        let pipeline = format!("playbin uri=\"{}\" text-sink=\"appsink name=iced_text sync=true drop=true\" video-sink=\"videoscale ! videoconvert ! appsink name=iced_video drop=true\"", uri.as_str());
+        let pipeline = format!("playbin uri=\"{}\" text-sink=\"appsink name=iced_text sync=true drop=true\" video-sink=\"videoscale ! videoconvert ! appsink name=iced_video drop=true caps=video/x-raw,format=NV12,pixel-aspect-ratio=1/1\"", uri.as_str());
         let pipeline = gst::parse::launch(pipeline.as_ref())?
             .downcast::<gst::Pipeline>()
             .map_err(|_| Error::Cast)?;
@@ -263,13 +256,7 @@ impl Video {
     }
 
     /// Creates a new video based on an existing GStreamer pipeline and appsink.
-    ///
-    /// **Important:** The `appsink` MUST be configured with `caps=video/x-raw,format=NV12`
-    /// to ensure frames are in NV12 format. Failure to do so will result in color distortion
-    /// due to incorrect YUV-to-RGB conversion in the shader.
-    ///
-    /// The video sink should be configured with a capsfilter specifying `colorimetry=bt709`
-    /// for proper color space handling, especially for H.264 content.
+    /// Expects an `appsink` plugin with `caps=video/x-raw,format=NV12`.
     ///
     /// An optional `text_sink` can be provided, which enables subtitle messages
     /// to be emitted.
