@@ -221,13 +221,14 @@ impl Video {
     pub fn new(uri: &url::Url) -> Result<Self, Error> {
         gst::init()?;
 
-        // GStreamer pipeline with explicit NV12 format enforcement and BT.709 colorimetry:
+        // GStreamer pipeline optimized for NV12 output
+        // - playbin: handles decoding and format negotiation
         // - videoscale: handles resolution adjustments
-        // - videoconvert: decodes/converts color spaces to NV12
-        // - capsfilter: explicitly specifies NV12 output format with BT.709 colorimetry (standard for H.264/HD)
-        // - appsink: accepts ONLY NV12 format (enforces the constraint)
-        // This ensures proper YUV→NV12 conversion for all codecs, especially H.264, preventing color distortion
-        let pipeline = format!("playbin uri=\"{}\" text-sink=\"appsink name=iced_text sync=true drop=true\" video-sink=\"videoscale ! videoconvert ! capsfilter caps=video/x-raw,format=NV12,colorimetry=bt709,pixel-aspect-ratio=1/1 ! appsink name=iced_video drop=true caps=video/x-raw,format=NV12\"", uri.as_str());
+        // - videoconvert: converts decoded video to NV12
+        // - appsink: receives NV12 frames
+        // NOTE: Not using capsfilter with strict format=NV12 because it can cause negotiation failures
+        // with certain decoders. Instead, we rely on videoconvert's default NV12 output.
+        let pipeline = format!("playbin uri=\"{}\" text-sink=\"appsink name=iced_text sync=true drop=true\" video-sink=\"videoscale ! videoconvert ! appsink name=iced_video drop=true\"", uri.as_str());
         let pipeline = gst::parse::launch(pipeline.as_ref())?
             .downcast::<gst::Pipeline>()
             .map_err(|_| Error::Cast)?;
@@ -297,17 +298,22 @@ impl Video {
         // extract resolution and framerate
         // TODO(jazzfool): maybe we want to extract some other information too?
         let caps = cleanup!(pad.current_caps().ok_or(Error::Caps))?;
+        log::debug!("Negotiated caps: {}", caps.to_string());
         let s = cleanup!(caps.structure(0).ok_or(Error::Caps))?;
 
         // Validate that the format is NV12 (critical for shader color conversion)
-        let format = cleanup!(s.get::<String>("format").map_err(|_| Error::Caps))?;
+        let format = cleanup!(s.get::<String>("format").map_err(|_| {
+            log::error!("Failed to extract 'format' from caps: {}", caps.to_string());
+            Error::Caps
+        }))?;
+        log::info!("Negotiated video format: '{}'", format);
         if format != "NV12" {
-            log::error!("Negotiated video format '{}' is not NV12. This will cause color distortion. \
-                        Ensure the GStreamer pipeline includes 'appsink caps=video/x-raw,format=NV12'", format);
+            log::error!("ERROR: Negotiated video format '{}' is not NV12. This will cause severe pixelation/glitches. \
+                        The GStreamer pipeline MUST produce NV12 format. Check that videoconvert can convert the codec to NV12.", format);
             let _ = pipeline.set_state(gst::State::Null);
             return Err(Error::Caps);
         }
-        log::debug!("Video format negotiated as NV12 (correct)");
+        log::info!("Video format correctly negotiated as NV12");
 
         let width = cleanup!(s.get::<i32>("width").map_err(|_| Error::Caps))?;
         let height = cleanup!(s.get::<i32>("height").map_err(|_| Error::Caps))?;
