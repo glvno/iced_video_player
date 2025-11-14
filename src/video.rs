@@ -221,12 +221,13 @@ impl Video {
     pub fn new(uri: &url::Url) -> Result<Self, Error> {
         gst::init()?;
 
-        // GStreamer pipeline with explicit NV12 format and BT.709 colorimetry:
+        // GStreamer pipeline with explicit NV12 format enforcement and BT.709 colorimetry:
         // - videoscale: handles resolution adjustments
         // - videoconvert: decodes/converts color spaces to NV12
         // - capsfilter: explicitly specifies NV12 output format with BT.709 colorimetry (standard for H.264/HD)
+        // - appsink: accepts ONLY NV12 format (enforces the constraint)
         // This ensures proper YUV→NV12 conversion for all codecs, especially H.264, preventing color distortion
-        let pipeline = format!("playbin uri=\"{}\" text-sink=\"appsink name=iced_text sync=true drop=true\" video-sink=\"videoscale ! videoconvert ! capsfilter caps=video/x-raw,format=NV12,colorimetry=bt709,pixel-aspect-ratio=1/1 ! appsink name=iced_video drop=true\"", uri.as_str());
+        let pipeline = format!("playbin uri=\"{}\" text-sink=\"appsink name=iced_text sync=true drop=true\" video-sink=\"videoscale ! videoconvert ! capsfilter caps=video/x-raw,format=NV12,colorimetry=bt709,pixel-aspect-ratio=1/1 ! appsink name=iced_video drop=true caps=video/x-raw,format=NV12\"", uri.as_str());
         let pipeline = gst::parse::launch(pipeline.as_ref())?
             .downcast::<gst::Pipeline>()
             .map_err(|_| Error::Cast)?;
@@ -249,7 +250,13 @@ impl Video {
     }
 
     /// Creates a new video based on an existing GStreamer pipeline and appsink.
-    /// Expects an `appsink` plugin with `caps=video/x-raw,format=NV12`.
+    ///
+    /// **Important:** The `appsink` MUST be configured with `caps=video/x-raw,format=NV12`
+    /// to ensure frames are in NV12 format. Failure to do so will result in color distortion
+    /// due to incorrect YUV-to-RGB conversion in the shader.
+    ///
+    /// The video sink should be configured with a capsfilter specifying `colorimetry=bt709`
+    /// for proper color space handling, especially for H.264 content.
     ///
     /// An optional `text_sink` can be provided, which enables subtitle messages
     /// to be emitted.
@@ -291,6 +298,17 @@ impl Video {
         // TODO(jazzfool): maybe we want to extract some other information too?
         let caps = cleanup!(pad.current_caps().ok_or(Error::Caps))?;
         let s = cleanup!(caps.structure(0).ok_or(Error::Caps))?;
+
+        // Validate that the format is NV12 (critical for shader color conversion)
+        let format = cleanup!(s.get::<String>("format").map_err(|_| Error::Caps))?;
+        if format != "NV12" {
+            log::error!("Negotiated video format '{}' is not NV12. This will cause color distortion. \
+                        Ensure the GStreamer pipeline includes 'appsink caps=video/x-raw,format=NV12'", format);
+            let _ = pipeline.set_state(gst::State::Null);
+            return Err(Error::Caps);
+        }
+        log::debug!("Video format negotiated as NV12 (correct)");
+
         let width = cleanup!(s.get::<i32>("width").map_err(|_| Error::Caps))?;
         let height = cleanup!(s.get::<i32>("height").map_err(|_| Error::Caps))?;
         // resolution should be mod4
