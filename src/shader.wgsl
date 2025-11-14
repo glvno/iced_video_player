@@ -38,9 +38,12 @@ fn vs_main(@builtin(vertex_index) in_vertex_index: u32) -> VertexOutput {
 
 @fragment
 fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
-    let yuv2r = vec3<f32>(1.164, 0.0, 1.596);
-    let yuv2g = vec3<f32>(1.164, -0.391, -0.813);
-    let yuv2b = vec3<f32>(1.164, 2.018, 0.0);
+    // BT.709 color space coefficients (used for HD video including H.264)
+    // These coefficients transform YUV to RGB using the ITU-R BT.709 standard
+    // which is the correct standard for HD/1080p content and H.264 video
+    let yuv2r = vec3<f32>(1.164, 0.0, 1.7927);
+    let yuv2g = vec3<f32>(1.164, -0.2132, -0.5329);
+    let yuv2b = vec3<f32>(1.164, 2.1124, 0.0);
 
     var yuv = vec3<f32>(0.0);
     yuv.x = textureSample(tex_y, s, in.uv).r - 0.0625;
