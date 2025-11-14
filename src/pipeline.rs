@@ -152,7 +152,6 @@ impl VideoPipeline {
     ) {
         // Use stride from GStreamer's VideoMeta if available, otherwise assume stride == width
         let stride = stride.unwrap_or(width);
-        eprintln!("Pipeline upload: width={}, height={}, stride={}, frame_size={}", width, height, stride, frame.len());
         if let Entry::Vacant(entry) = self.videos.entry(video_id) {
             let texture_y = device.create_texture(&wgpu::TextureDescriptor {
                 label: Some("iced_video_player texture"),

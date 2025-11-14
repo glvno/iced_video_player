@@ -313,39 +313,6 @@ impl Video {
         log::debug!("Negotiated caps: {}", caps.to_string());
         let s = cleanup!(caps.structure(0).ok_or(Error::Caps))?;
 
-        // Log all negotiated caps for debugging
-        eprintln!("\n=== CAPS DEBUG ===");
-        eprintln!("Full negotiated caps: {}", caps.to_string());
-        eprintln!("========================\n");
-
-        // Try to extract the format - if it fails, that's important info
-        let format_result = s.get::<String>("format");
-        let format = match format_result {
-            Ok(fmt) => {
-                eprintln!("Negotiated video format: '{}'", fmt);
-                fmt
-            }
-            Err(e) => {
-                eprintln!("WARNING: Could not extract 'format' from caps. Error: {:?}", e);
-                eprintln!("Available fields in caps structure:");
-                for (name, _value) in s.iter() {
-                    eprintln!("  - {}", name);
-                }
-                eprintln!("This likely means the format is not what we expect.");
-                eprintln!("Trying to continue anyway, but video will likely display incorrectly.");
-                "UNKNOWN".to_string()
-            }
-        };
-
-        if format != "NV12" && format != "UNKNOWN" {
-            eprintln!("\nWARNING: Negotiated format is '{}', not 'NV12'", format);
-            eprintln!("This will cause severe pixelation/glitches because:");
-            eprintln!("  - NV12: Y plane, then interleaved U/V plane");
-            eprintln!("  - I420: Y plane, U plane, V plane (all separate)");
-            eprintln!("  - If I420 is read as NV12, memory layout is completely wrong");
-            eprintln!();
-        }
-
         let width = cleanup!(s.get::<i32>("width").map_err(|_| Error::Caps))?;
         let height = cleanup!(s.get::<i32>("height").map_err(|_| Error::Caps))?;
         // resolution should be mod4
@@ -677,7 +644,6 @@ impl Video {
                     let frame_guard = inner.frame.lock().map_err(|_| Error::Lock)?;
                     let frame = frame_guard.readable().ok_or(Error::Lock)?;
                     let stride = frame_guard.stride();
-                    eprintln!("Thumbnail stride extracted: {:?}", stride);
 
                     Ok(img::Handle::from_rgba(
                         inner.width as u32 / downscale,
@@ -699,13 +665,6 @@ impl Video {
 fn yuv_to_rgba(yuv: &[u8], width: u32, height: u32, downscale: u32, stride: Option<u32>) -> Vec<u8> {
     // Use stride from VideoMeta if available, otherwise assume stride == width
     let stride = stride.unwrap_or(width);
-    eprintln!("\n=== YUV_TO_RGBA DEBUG ===");
-    eprintln!("Frame info: width={}, height={}, stride={}", width, height, stride);
-    eprintln!("Total buffer size: {} bytes", yuv.len());
-    eprintln!("Expected Y plane size: {} bytes", stride * height);
-    eprintln!("Expected UV plane start: {} bytes", stride * height);
-    eprintln!("Expected total size: {} bytes", stride * height + (stride * height / 2));
-    eprintln!("========================\n");
 
     let uv_start = stride * height;
     let mut rgba = vec![];
@@ -726,10 +685,9 @@ fn yuv_to_rgba(yuv: &[u8], width: u32, height: u32, downscale: u32, stride: Opti
             let u = yuv[uv_offset] as f32;
             let v = yuv[uv_offset + 1] as f32;
 
-            // BT.709 color space coefficients (standard for HD/H.264 video)
-            let r = 1.164 * (y - 16.0) + 1.7927 * (v - 128.0);
-            let g = 1.164 * (y - 16.0) - 0.5329 * (v - 128.0) - 0.2132 * (u - 128.0);
-            let b = 1.164 * (y - 16.0) + 2.1124 * (u - 128.0);
+            let r = 1.164 * (y - 16.0) + 1.596 * (v - 128.0);
+            let g = 1.164 * (y - 16.0) - 0.813 * (v - 128.0) - 0.391 * (u - 128.0);
+            let b = 1.164 * (y - 16.0) + 2.018 * (u - 128.0);
 
             rgba.push(r as u8);
             rgba.push(g as u8);
