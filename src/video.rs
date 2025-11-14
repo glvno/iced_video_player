@@ -301,19 +301,38 @@ impl Video {
         log::debug!("Negotiated caps: {}", caps.to_string());
         let s = cleanup!(caps.structure(0).ok_or(Error::Caps))?;
 
-        // Validate that the format is NV12 (critical for shader color conversion)
-        let format = cleanup!(s.get::<String>("format").map_err(|_| {
-            log::error!("Failed to extract 'format' from caps: {}", caps.to_string());
-            Error::Caps
-        }))?;
-        log::info!("Negotiated video format: '{}'", format);
-        if format != "NV12" {
-            log::error!("ERROR: Negotiated video format '{}' is not NV12. This will cause severe pixelation/glitches. \
-                        The GStreamer pipeline MUST produce NV12 format. Check that videoconvert can convert the codec to NV12.", format);
-            let _ = pipeline.set_state(gst::State::Null);
-            return Err(Error::Caps);
+        // Log all negotiated caps for debugging
+        eprintln!("\n=== CAPS DEBUG ===");
+        eprintln!("Full negotiated caps: {}", caps.to_string());
+        eprintln!("========================\n");
+
+        // Try to extract the format - if it fails, that's important info
+        let format_result = s.get::<String>("format");
+        let format = match format_result {
+            Ok(fmt) => {
+                eprintln!("Negotiated video format: '{}'", fmt);
+                fmt
+            }
+            Err(e) => {
+                eprintln!("WARNING: Could not extract 'format' from caps. Error: {:?}", e);
+                eprintln!("Available fields in caps structure:");
+                for (name, _value) in s.iter() {
+                    eprintln!("  - {}", name);
+                }
+                eprintln!("This likely means the format is not what we expect.");
+                eprintln!("Trying to continue anyway, but video will likely display incorrectly.");
+                "UNKNOWN".to_string()
+            }
+        };
+
+        if format != "NV12" && format != "UNKNOWN" {
+            eprintln!("\nWARNING: Negotiated format is '{}', not 'NV12'", format);
+            eprintln!("This will cause severe pixelation/glitches because:");
+            eprintln!("  - NV12: Y plane, then interleaved U/V plane");
+            eprintln!("  - I420: Y plane, U plane, V plane (all separate)");
+            eprintln!("  - If I420 is read as NV12, memory layout is completely wrong");
+            eprintln!();
         }
-        log::info!("Video format correctly negotiated as NV12");
 
         let width = cleanup!(s.get::<i32>("width").map_err(|_| Error::Caps))?;
         let height = cleanup!(s.get::<i32>("height").map_err(|_| Error::Caps))?;
