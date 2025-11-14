@@ -273,6 +273,10 @@ impl Video {
 
         let pad = video_sink.pads().first().cloned().unwrap();
 
+        // Mute and set volume to 0 before entering Playing state to prevent audio burst on load
+        pipeline.set_property("mute", true);
+        pipeline.set_property("volume", 0.0);
+
         cleanup!(pipeline.set_state(gst::State::Playing))?;
 
         // wait for up to 5 seconds until the decoder gets the source capabilities
