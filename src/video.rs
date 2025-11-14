@@ -677,6 +677,7 @@ impl Video {
                     let frame_guard = inner.frame.lock().map_err(|_| Error::Lock)?;
                     let frame = frame_guard.readable().ok_or(Error::Lock)?;
                     let stride = frame_guard.stride();
+                    eprintln!("Thumbnail stride extracted: {:?}", stride);
 
                     Ok(img::Handle::from_rgba(
                         inner.width as u32 / downscale,
@@ -698,6 +699,14 @@ impl Video {
 fn yuv_to_rgba(yuv: &[u8], width: u32, height: u32, downscale: u32, stride: Option<u32>) -> Vec<u8> {
     // Use stride from VideoMeta if available, otherwise assume stride == width
     let stride = stride.unwrap_or(width);
+    eprintln!("\n=== YUV_TO_RGBA DEBUG ===");
+    eprintln!("Frame info: width={}, height={}, stride={}", width, height, stride);
+    eprintln!("Total buffer size: {} bytes", yuv.len());
+    eprintln!("Expected Y plane size: {} bytes", stride * height);
+    eprintln!("Expected UV plane start: {} bytes", stride * height);
+    eprintln!("Expected total size: {} bytes", stride * height + (stride * height / 2));
+    eprintln!("========================\n");
+
     let uv_start = stride * height;
     let mut rgba = vec![];
 
