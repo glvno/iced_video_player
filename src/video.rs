@@ -221,7 +221,12 @@ impl Video {
     pub fn new(uri: &url::Url) -> Result<Self, Error> {
         gst::init()?;
 
-        let pipeline = format!("playbin uri=\"{}\" text-sink=\"appsink name=iced_text sync=true drop=true\" video-sink=\"videoscale ! videoconvert ! appsink name=iced_video drop=true caps=video/x-raw,format=NV12,pixel-aspect-ratio=1/1\"", uri.as_str());
+        // GStreamer pipeline with explicit NV12 format and BT.709 colorimetry:
+        // - videoscale: handles resolution adjustments
+        // - videoconvert: decodes/converts color spaces to NV12
+        // - capsfilter: explicitly specifies NV12 output format with BT.709 colorimetry (standard for H.264/HD)
+        // This ensures proper YUV→NV12 conversion for all codecs, especially H.264, preventing color distortion
+        let pipeline = format!("playbin uri=\"{}\" text-sink=\"appsink name=iced_text sync=true drop=true\" video-sink=\"videoscale ! videoconvert ! capsfilter caps=video/x-raw,format=NV12,colorimetry=bt709,pixel-aspect-ratio=1/1 ! appsink name=iced_video drop=true\"", uri.as_str());
         let pipeline = gst::parse::launch(pipeline.as_ref())?
             .downcast::<gst::Pipeline>()
             .map_err(|_| Error::Cast)?;
