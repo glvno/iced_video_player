@@ -100,15 +100,17 @@ impl Internal {
         let position = position.into();
 
         // gstreamer complains if the start & end value types aren't the same
+        // NOTE: We DO NOT use the FLUSH flag for seeks because it causes FLUSH_START events
+        // that can deadlock when multiple pipelines seek simultaneously. Non-flushing seeks
+        // are slower but avoid the mutex contention deadlock.
         match &position {
             Position::Time(_) => self.source.seek(
                 self.speed,
-                gst::SeekFlags::FLUSH
-                    | if accurate {
-                        gst::SeekFlags::ACCURATE
-                    } else {
-                        gst::SeekFlags::empty()
-                    },
+                if accurate {
+                    gst::SeekFlags::ACCURATE
+                } else {
+                    gst::SeekFlags::empty()
+                },
                 gst::SeekType::Set,
                 gst::GenericFormattedValue::from(position),
                 gst::SeekType::Set,
@@ -116,12 +118,11 @@ impl Internal {
             )?,
             Position::Frame(_) => self.source.seek(
                 self.speed,
-                gst::SeekFlags::FLUSH
-                    | if accurate {
-                        gst::SeekFlags::ACCURATE
-                    } else {
-                        gst::SeekFlags::empty()
-                    },
+                if accurate {
+                    gst::SeekFlags::ACCURATE
+                } else {
+                    gst::SeekFlags::empty()
+                },
                 gst::SeekType::Set,
                 gst::GenericFormattedValue::from(position),
                 gst::SeekType::Set,
@@ -139,10 +140,11 @@ impl Internal {
         let Some(position) = self.source.query_position::<gst::ClockTime>() else {
             return Err(Error::Caps);
         };
+        // NOTE: Not using FLUSH flag to avoid deadlock with concurrent seeks
         if speed > 0.0 {
             self.source.seek(
                 speed,
-                gst::SeekFlags::FLUSH | gst::SeekFlags::ACCURATE,
+                gst::SeekFlags::ACCURATE,
                 gst::SeekType::Set,
                 position,
                 gst::SeekType::End,
@@ -151,7 +153,7 @@ impl Internal {
         } else {
             self.source.seek(
                 speed,
-                gst::SeekFlags::FLUSH | gst::SeekFlags::ACCURATE,
+                gst::SeekFlags::ACCURATE,
                 gst::SeekType::Set,
                 gst::ClockTime::from_seconds(0),
                 gst::SeekType::Set,
