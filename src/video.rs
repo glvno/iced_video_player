@@ -8,8 +8,9 @@ use iced::widget::image as img;
 use std::num::NonZeroU8;
 use std::ops::{Deref, DerefMut};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, RwLock, OnceLock};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
+use std::sync::OnceLock;
 
 /// Global lock to serialize seek operations and prevent FLUSH_START deadlocks
 fn get_seek_lock() -> &'static Mutex<()> {
@@ -103,21 +104,19 @@ pub(crate) struct Internal {
 
 impl Internal {
     pub(crate) fn seek(&self, position: impl Into<Position>, accurate: bool) -> Result<(), Error> {
-        // Serialize all seek operations to prevent concurrent FLUSH_START deadlock.
-        // We hold the lock for the entire seek operation to ensure it completes before
-        // the next seek can begin, preventing multiple concurrent FLUSH_START events.
+        // Serialize user-triggered seeks to prevent mutex contention.
+        // Note: GStreamer handles looping internally via video.set_looping(true),
+        // so this lock only protects user-triggered seeks, not looping.
         let _lock = get_seek_lock().lock().expect("seek lock poisoned");
 
         let position = position.into();
 
-        // NOTE: NOT using FLUSH flag to avoid mutex deadlock in gst_base_sink_flush_start.
-        // When videos are paused (via app-level pause/seek/resume pattern), non-flushing seeks work fine.
-        // The serialization lock ensures only one seek happens at a time across all videos.
-        let seek_flags = if accurate {
-            gst::SeekFlags::ACCURATE
-        } else {
-            gst::SeekFlags::empty()
-        };
+        let seek_flags = gst::SeekFlags::FLUSH
+            | if accurate {
+                gst::SeekFlags::ACCURATE
+            } else {
+                gst::SeekFlags::empty()
+            };
 
         // gstreamer complains if the start & end value types aren't the same
         match &position {
