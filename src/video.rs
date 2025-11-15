@@ -382,7 +382,7 @@ impl Video {
             let mut clear_subtitles_at = None;
 
             while alive_ref.load(Ordering::Acquire) {
-                if let Err(gst::FlowError::Error) = (|| -> Result<(), gst::FlowError> {
+                match (|| -> Result<(), gst::FlowError> {
                     // Use intended_paused state instead of querying GStreamer to ensure
                     // synchronization with main thread during async state transitions
                     let sample =
@@ -463,7 +463,21 @@ impl Video {
 
                     Ok(())
                 })() {
-                    log::error!("error pulling frame");
+                    Ok(()) => {
+                        // Frame pulled successfully, continue
+                    }
+                    Err(gst::FlowError::Eos) => {
+                        // End of stream reached. Sleep briefly to allow GStreamer's looping
+                        // mechanism to restart the video. This prevents busy-waiting when video loops.
+                        std::thread::sleep(std::time::Duration::from_millis(10));
+                    }
+                    Err(gst::FlowError::Error) => {
+                        log::error!("error pulling frame");
+                    }
+                    Err(other) => {
+                        log::warn!("unexpected flow error: {:?}", other);
+                        std::thread::sleep(std::time::Duration::from_millis(10));
+                    }
                 }
             }
         });
