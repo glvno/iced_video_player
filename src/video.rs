@@ -103,14 +103,16 @@ pub(crate) struct Internal {
 
 impl Internal {
     pub(crate) fn seek(&self, position: impl Into<Position>, accurate: bool) -> Result<(), Error> {
-        // Serialize all seek operations to prevent concurrent FLUSH_START deadlock
+        // Serialize all seek operations to prevent concurrent FLUSH_START deadlock.
+        // We hold the lock for the entire seek operation to ensure it completes before
+        // the next seek can begin, preventing multiple concurrent FLUSH_START events.
         let _lock = get_seek_lock().lock().expect("seek lock poisoned");
 
         let position = position.into();
 
-        // NOTE: NOT using FLUSH flag because FLUSH_START events are processed asynchronously
-        // by GStreamer worker threads and can cause mutex deadlock in gst_base_sink_flush_start.
-        // Without FLUSH flag, the seek is still processed but without async event propagation deadlock.
+        // NOTE: NOT using FLUSH flag to avoid mutex deadlock in gst_base_sink_flush_start.
+        // When videos are paused (via app-level pause/seek/resume pattern), non-flushing seeks work fine.
+        // The serialization lock ensures only one seek happens at a time across all videos.
         let seek_flags = if accurate {
             gst::SeekFlags::ACCURATE
         } else {
