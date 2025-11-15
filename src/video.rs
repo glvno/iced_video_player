@@ -180,13 +180,19 @@ impl Internal {
     }
 
     pub(crate) fn set_paused(&mut self, paused: bool) {
-        self.source
-            .set_state(if paused {
+        // IMPORTANT: Calling set_state() from the main thread on macOS causes deadlock with
+        // GStreamer's OSX audio sink when it tries to acquire CoreAudio HALB_Mutex.
+        // Solution: Move the state change to a background thread to allow the main thread
+        // to continue without blocking on GStreamer's mutex operations.
+
+        let source_clone = self.source.clone();
+        std::thread::spawn(move || {
+            let _ = source_clone.set_state(if paused {
                 gst::State::Paused
             } else {
                 gst::State::Playing
-            })
-            .unwrap(/* state was changed in ctor; state errors caught there */);
+            });
+        });
 
         // Set restart_stream flag to make the stream restart on the next Message::NextFrame
         if self.is_eos && !paused {
