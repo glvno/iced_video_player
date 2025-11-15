@@ -100,6 +100,11 @@ pub(crate) struct Internal {
 
     pub(crate) subtitle_text: Arc<Mutex<Option<String>>>,
     pub(crate) upload_text: Arc<AtomicBool>,
+
+    /// Local tracking of intended paused state.
+    /// Used instead of querying GStreamer state to avoid race conditions
+    /// with asynchronous set_state() calls in background threads.
+    pub(crate) intended_paused: bool,
 }
 
 impl Internal {
@@ -185,6 +190,10 @@ impl Internal {
         // Solution: Move the state change to a background thread to allow the main thread
         // to continue without blocking on GStreamer's mutex operations.
 
+        // Track the intended paused state LOCALLY first to avoid race conditions
+        // where paused() might query GStreamer before the state change completes.
+        self.intended_paused = paused;
+
         let source_clone = self.source.clone();
         std::thread::spawn(move || {
             let _ = source_clone.set_state(if paused {
@@ -201,7 +210,11 @@ impl Internal {
     }
 
     pub(crate) fn paused(&self) -> bool {
-        self.source.state(gst::ClockTime::ZERO).1 == gst::State::Paused
+        // Return the LOCAL intended paused state instead of querying GStreamer.
+        // This avoids race conditions where the background thread might still be
+        // applying the state change. The intended_paused field is set BEFORE
+        // spawning the background thread that calls set_state().
+        self.intended_paused
     }
 
     /// Syncs audio with video when there is (inevitably) latency presenting the frame.
@@ -476,6 +489,8 @@ impl Video {
 
             subtitle_text,
             upload_text,
+
+            intended_paused: false,
         })))
     }
 
