@@ -354,11 +354,11 @@ impl Video {
                     let sample =
                         if pipeline_ref.state(gst::ClockTime::ZERO).1 != gst::State::Playing {
                             video_sink
-                                .try_pull_preroll(gst::ClockTime::from_mseconds(16))
+                                .try_pull_preroll(gst::ClockTime::from_mseconds(50))
                                 .ok_or(gst::FlowError::Eos)?
                         } else {
                             video_sink
-                                .try_pull_sample(gst::ClockTime::from_mseconds(16))
+                                .try_pull_sample(gst::ClockTime::from_mseconds(50))
                                 .ok_or(gst::FlowError::Eos)?
                         };
 
