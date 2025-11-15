@@ -152,7 +152,10 @@ impl VideoPipeline {
     ) {
         // Use stride from GStreamer's VideoMeta if available, otherwise assume stride == width
         let stride = stride.unwrap_or(width);
+        let active_videos_before = self.videos.len();
         if let Entry::Vacant(entry) = self.videos.entry(video_id) {
+            log::debug!("Creating new texture entry for video_id={}, size={}x{}, stride={}, active_videos={}",
+                       video_id, width, height, stride, active_videos_before);
             let texture_y = device.create_texture(&wgpu::TextureDescriptor {
                 label: Some("iced_video_player texture"),
                 size: wgpu::Extent3d {
@@ -304,8 +307,12 @@ impl VideoPipeline {
             .iter()
             .filter_map(|(id, entry)| (!entry.alive.load(Ordering::SeqCst)).then_some(*id))
             .collect();
+        if !ids.is_empty() {
+            log::debug!("Cleaning up {} dead video(s), active_before={}", ids.len(), self.videos.len());
+        }
         for id in ids {
             if let Some(video) = self.videos.remove(&id) {
+                log::debug!("Destroyed texture resources for video_id={}", id);
                 video.texture_y.destroy();
                 video.texture_uv.destroy();
                 video.instances.destroy();
@@ -350,6 +357,8 @@ impl VideoPipeline {
         video_id: u64,
     ) {
         if let Some(video) = self.videos.get(&video_id) {
+            log::trace!("Drawing video_id={}, active_videos={}, alive={}",
+                       video_id, self.videos.len(), video.alive.load(Ordering::SeqCst));
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("iced_video_player render pass"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
@@ -379,6 +388,8 @@ impl VideoPipeline {
 
             video.prepare_index.store(0, Ordering::Relaxed);
             video.render_index.fetch_add(1, Ordering::Relaxed);
+        } else {
+            log::warn!("Video not found for draw: video_id={}, active_videos={}", video_id, self.videos.len());
         }
     }
 }
