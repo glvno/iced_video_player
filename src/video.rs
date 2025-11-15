@@ -101,10 +101,11 @@ pub(crate) struct Internal {
     pub(crate) subtitle_text: Arc<Mutex<Option<String>>>,
     pub(crate) upload_text: Arc<AtomicBool>,
 
-    /// Local tracking of intended paused state.
+    /// Local tracking of intended paused state (atomic for worker thread access).
     /// Used instead of querying GStreamer state to avoid race conditions
     /// with asynchronous set_state() calls in background threads.
-    pub(crate) intended_paused: bool,
+    /// Both main thread and worker thread check this to ensure synchronization.
+    pub(crate) intended_paused: Arc<AtomicBool>,
 }
 
 impl Internal {
@@ -190,9 +191,9 @@ impl Internal {
         // Solution: Move the state change to a background thread to allow the main thread
         // to continue without blocking on GStreamer's mutex operations.
 
-        // Track the intended paused state LOCALLY first to avoid race conditions
-        // where paused() might query GStreamer before the state change completes.
-        self.intended_paused = paused;
+        // Track the intended paused state ATOMICALLY so the worker thread can also check it.
+        // This ensures both main thread and worker thread see the same state during transitions.
+        self.intended_paused.store(paused, Ordering::SeqCst);
 
         let source_clone = self.source.clone();
         std::thread::spawn(move || {
@@ -214,7 +215,7 @@ impl Internal {
         // This avoids race conditions where the background thread might still be
         // applying the state change. The intended_paused field is set BEFORE
         // spawning the background thread that calls set_state().
-        self.intended_paused
+        self.intended_paused.load(Ordering::SeqCst)
     }
 
     /// Syncs audio with video when there is (inevitably) latency presenting the frame.
@@ -373,15 +374,19 @@ impl Video {
         let subtitle_text_ref = Arc::clone(&subtitle_text);
         let upload_text_ref = Arc::clone(&upload_text);
 
-        let pipeline_ref = pipeline.clone();
+        // Track intended paused state atomically for synchronization with worker thread
+        let intended_paused = Arc::new(AtomicBool::new(false));
+        let intended_paused_ref = Arc::clone(&intended_paused);
 
         let worker = std::thread::spawn(move || {
             let mut clear_subtitles_at = None;
 
             while alive_ref.load(Ordering::Acquire) {
                 if let Err(gst::FlowError::Error) = (|| -> Result<(), gst::FlowError> {
+                    // Use intended_paused state instead of querying GStreamer to ensure
+                    // synchronization with main thread during async state transitions
                     let sample =
-                        if pipeline_ref.state(gst::ClockTime::ZERO).1 != gst::State::Playing {
+                        if intended_paused_ref.load(Ordering::SeqCst) {
                             video_sink
                                 .try_pull_preroll(gst::ClockTime::from_mseconds(50))
                                 .ok_or(gst::FlowError::Eos)?
@@ -490,7 +495,7 @@ impl Video {
             subtitle_text,
             upload_text,
 
-            intended_paused: false,
+            intended_paused,
         })))
     }
 
