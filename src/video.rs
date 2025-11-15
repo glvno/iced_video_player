@@ -8,8 +8,14 @@ use iced::widget::image as img;
 use std::num::NonZeroU8;
 use std::ops::{Deref, DerefMut};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, Mutex, RwLock, OnceLock};
 use std::time::{Duration, Instant};
+
+/// Global lock to serialize seek operations and prevent FLUSH_START deadlocks
+fn get_seek_lock() -> &'static Mutex<()> {
+    static SEEK_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    SEEK_LOCK.get_or_init(|| Mutex::new(()))
+}
 
 /// Position in the media.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -97,20 +103,21 @@ pub(crate) struct Internal {
 
 impl Internal {
     pub(crate) fn seek(&self, position: impl Into<Position>, accurate: bool) -> Result<(), Error> {
+        // Serialize all seek operations to prevent concurrent FLUSH_START deadlock
+        let _lock = get_seek_lock().lock().expect("seek lock poisoned");
+
         let position = position.into();
 
         // gstreamer complains if the start & end value types aren't the same
-        // NOTE: We DO NOT use the FLUSH flag for seeks because it causes FLUSH_START events
-        // that can deadlock when multiple pipelines seek simultaneously. Non-flushing seeks
-        // are slower but avoid the mutex contention deadlock.
         match &position {
             Position::Time(_) => self.source.seek(
                 self.speed,
-                if accurate {
-                    gst::SeekFlags::ACCURATE
-                } else {
-                    gst::SeekFlags::empty()
-                },
+                gst::SeekFlags::FLUSH
+                    | if accurate {
+                        gst::SeekFlags::ACCURATE
+                    } else {
+                        gst::SeekFlags::empty()
+                    },
                 gst::SeekType::Set,
                 gst::GenericFormattedValue::from(position),
                 gst::SeekType::Set,
@@ -118,11 +125,12 @@ impl Internal {
             )?,
             Position::Frame(_) => self.source.seek(
                 self.speed,
-                if accurate {
-                    gst::SeekFlags::ACCURATE
-                } else {
-                    gst::SeekFlags::empty()
-                },
+                gst::SeekFlags::FLUSH
+                    | if accurate {
+                        gst::SeekFlags::ACCURATE
+                    } else {
+                        gst::SeekFlags::empty()
+                    },
                 gst::SeekType::Set,
                 gst::GenericFormattedValue::from(position),
                 gst::SeekType::Set,
