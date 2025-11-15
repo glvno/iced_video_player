@@ -289,7 +289,10 @@ impl Video {
         pipeline.set_property("mute", true);
         pipeline.set_property("volume", 0.0);
 
-        cleanup!(pipeline.set_state(gst::State::Playing))?;
+        // Defer entering Playing state to prevent GStreamer FLUSH_START deadlocks
+        // when multiple pipelines initialize simultaneously.
+        // We set to Paused first, wait for caps, then transition to Playing in a spawned task.
+        cleanup!(pipeline.set_state(gst::State::Paused))?;
 
         // wait for up to 5 seconds until the decoder gets the source capabilities
         cleanup!(pipeline.state(gst::ClockTime::from_seconds(5)).0)?;
