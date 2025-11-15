@@ -108,16 +108,20 @@ impl Internal {
 
         let position = position.into();
 
+        // NOTE: NOT using FLUSH flag because FLUSH_START events are processed asynchronously
+        // by GStreamer worker threads and can cause mutex deadlock in gst_base_sink_flush_start.
+        // Without FLUSH flag, the seek is still processed but without async event propagation deadlock.
+        let seek_flags = if accurate {
+            gst::SeekFlags::ACCURATE
+        } else {
+            gst::SeekFlags::empty()
+        };
+
         // gstreamer complains if the start & end value types aren't the same
         match &position {
             Position::Time(_) => self.source.seek(
                 self.speed,
-                gst::SeekFlags::FLUSH
-                    | if accurate {
-                        gst::SeekFlags::ACCURATE
-                    } else {
-                        gst::SeekFlags::empty()
-                    },
+                seek_flags,
                 gst::SeekType::Set,
                 gst::GenericFormattedValue::from(position),
                 gst::SeekType::Set,
@@ -125,12 +129,7 @@ impl Internal {
             )?,
             Position::Frame(_) => self.source.seek(
                 self.speed,
-                gst::SeekFlags::FLUSH
-                    | if accurate {
-                        gst::SeekFlags::ACCURATE
-                    } else {
-                        gst::SeekFlags::empty()
-                    },
+                seek_flags,
                 gst::SeekType::Set,
                 gst::GenericFormattedValue::from(position),
                 gst::SeekType::Set,
