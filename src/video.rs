@@ -10,13 +10,6 @@ use std::ops::{Deref, DerefMut};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
-use std::sync::OnceLock;
-
-/// Global lock to serialize seek operations and prevent FLUSH_START deadlocks
-fn get_seek_lock() -> &'static Mutex<()> {
-    static SEEK_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-    SEEK_LOCK.get_or_init(|| Mutex::new(()))
-}
 
 /// Position in the media.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -109,7 +102,7 @@ pub(crate) struct Internal {
 }
 
 impl Internal {
-    pub(crate) fn seek(&mut self, position: impl Into<Position>, accurate: bool) -> Result<(), Error> {
+    pub(crate) fn seek(&self, position: impl Into<Position>, accurate: bool) -> Result<(), Error> {
         // IMPORTANT: Calling seek() from the main thread on macOS causes deadlock with
         // GStreamer's OSX audio sink when it tries to acquire CoreAudio HALB_Mutex.
         // Solution: Move the seek operation to a background thread to allow the main thread
@@ -134,9 +127,6 @@ impl Internal {
 
         // Spawn a background thread to perform the seek without blocking the main thread
         std::thread::spawn(move || {
-            // Serialize seeks to prevent concurrent FLUSH_START deadlocks
-            let _lock = get_seek_lock().lock().expect("seek lock poisoned");
-
             // Perform the seek operation in the background thread
             // gstreamer complains if the start & end value types aren't the same
             let seek_result = match &position {
