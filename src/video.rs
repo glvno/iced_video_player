@@ -109,11 +109,11 @@ pub(crate) struct Internal {
 }
 
 impl Internal {
-    pub(crate) fn seek(&self, position: impl Into<Position>, accurate: bool) -> Result<(), Error> {
-        // Serialize user-triggered seeks to prevent mutex contention.
-        // Note: GStreamer handles looping internally via video.set_looping(true),
-        // so this lock only protects user-triggered seeks, not looping.
-        let _lock = get_seek_lock().lock().expect("seek lock poisoned");
+    pub(crate) fn seek(&mut self, position: impl Into<Position>, accurate: bool) -> Result<(), Error> {
+        // IMPORTANT: Calling seek() from the main thread on macOS causes deadlock with
+        // GStreamer's OSX audio sink when it tries to acquire CoreAudio HALB_Mutex.
+        // Solution: Move the seek operation to a background thread to allow the main thread
+        // to continue without blocking on GStreamer's mutex operations.
 
         let position = position.into();
 
@@ -124,28 +124,44 @@ impl Internal {
                 gst::SeekFlags::empty()
             };
 
-        // gstreamer complains if the start & end value types aren't the same
-        match &position {
-            Position::Time(_) => self.source.seek(
-                self.speed,
-                seek_flags,
-                gst::SeekType::Set,
-                gst::GenericFormattedValue::from(position),
-                gst::SeekType::Set,
-                gst::ClockTime::NONE,
-            )?,
-            Position::Frame(_) => self.source.seek(
-                self.speed,
-                seek_flags,
-                gst::SeekType::Set,
-                gst::GenericFormattedValue::from(position),
-                gst::SeekType::Set,
-                gst::format::Default::NONE,
-            )?,
-        };
-
+        // Clear subtitles immediately
         *self.subtitle_text.lock().expect("lock subtitle_text") = None;
         self.upload_text.store(true, Ordering::SeqCst);
+
+        // Clone the source pipeline for the background thread
+        let source_clone = self.source.clone();
+        let speed = self.speed;
+
+        // Spawn a background thread to perform the seek without blocking the main thread
+        std::thread::spawn(move || {
+            // Serialize seeks to prevent concurrent FLUSH_START deadlocks
+            let _lock = get_seek_lock().lock().expect("seek lock poisoned");
+
+            // Perform the seek operation in the background thread
+            // gstreamer complains if the start & end value types aren't the same
+            let seek_result = match &position {
+                Position::Time(_) => source_clone.seek(
+                    speed,
+                    seek_flags,
+                    gst::SeekType::Set,
+                    gst::GenericFormattedValue::from(position),
+                    gst::SeekType::Set,
+                    gst::ClockTime::NONE,
+                ),
+                Position::Frame(_) => source_clone.seek(
+                    speed,
+                    seek_flags,
+                    gst::SeekType::Set,
+                    gst::GenericFormattedValue::from(position),
+                    gst::SeekType::Set,
+                    gst::format::Default::NONE,
+                ),
+            };
+
+            if let Err(e) = seek_result {
+                log::warn!("seek operation failed in background thread: {:?}", e);
+            }
+        });
 
         Ok(())
     }
