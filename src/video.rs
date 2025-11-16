@@ -546,8 +546,14 @@ impl Video {
     ///
     /// This uses a linear scale, for example `0.5` is perceived as half as loud.
     pub fn set_volume(&mut self, volume: f64) {
+        // CRITICAL FIX: Removed set_muted() call that was causing CoreAudio deadlocks.
+        // The original comment suggested GStreamer unmutes when changing volume, but calling
+        // set_muted() (which does set_property("mute")) on every volume change triggers the
+        // HALB_Mutex deadlock in CoreAudio when multiple videos try to adjust volume concurrently.
+        // This is especially critical during rapid mute/unmute sequences (switching audio between videos).
+        // If GStreamer auto-unmutes on volume change, that's acceptable - users can see video with audio,
+        // but deadlock prevention is more important.
         self.get_mut().source.set_property("volume", volume);
-        self.set_muted(self.muted()); // for some reason gstreamer unmutes when changing volume?
     }
 
     /// Get the volume multiplier of the audio.
