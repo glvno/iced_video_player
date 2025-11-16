@@ -2,7 +2,6 @@ use crate::Error;
 use gstreamer as gst;
 use gstreamer_app as gst_app;
 use gstreamer_app::prelude::*;
-use gstreamer_video::prelude::*;
 use gstreamer_video::VideoMeta;
 use iced::widget::image as img;
 use std::num::NonZeroU8;
