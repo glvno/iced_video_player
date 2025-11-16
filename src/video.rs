@@ -59,9 +59,9 @@ impl Frame {
     /// This is critical for proper NV12 decoding, as the stride may differ from width.
     pub fn stride(&self) -> Option<u32> {
         self.0.buffer().and_then(|buffer| {
-            buffer.meta::<VideoMeta>().map(|meta| {
-                meta.stride()[0] as u32
-            })
+            buffer
+                .meta::<VideoMeta>()
+                .map(|meta| meta.stride()[0] as u32)
         })
     }
 }
@@ -93,65 +93,44 @@ pub(crate) struct Internal {
 
     pub(crate) subtitle_text: Arc<Mutex<Option<String>>>,
     pub(crate) upload_text: Arc<AtomicBool>,
-
-    /// Local tracking of intended paused state (atomic for worker thread access).
-    /// Used instead of querying GStreamer state to avoid race conditions
-    /// with asynchronous set_state() calls in background threads.
-    /// Both main thread and worker thread check this to ensure synchronization.
-    pub(crate) intended_paused: Arc<AtomicBool>,
 }
 
 impl Internal {
     pub(crate) fn seek(&self, position: impl Into<Position>, accurate: bool) -> Result<(), Error> {
-        // IMPORTANT: Calling seek() from the main thread on macOS causes deadlock with
-        // GStreamer's OSX audio sink when it tries to acquire CoreAudio HALB_Mutex.
-        // Solution: Move the seek operation to a background thread to allow the main thread
-        // to continue without blocking on GStreamer's mutex operations.
-
         let position = position.into();
 
-        let seek_flags = gst::SeekFlags::FLUSH
-            | if accurate {
-                gst::SeekFlags::ACCURATE
-            } else {
-                gst::SeekFlags::empty()
-            };
+        // gstreamer complains if the start & end value types aren't the same
+        match &position {
+            Position::Time(_) => self.source.seek(
+                self.speed,
+                gst::SeekFlags::FLUSH
+                    | if accurate {
+                        gst::SeekFlags::ACCURATE
+                    } else {
+                        gst::SeekFlags::empty()
+                    },
+                gst::SeekType::Set,
+                gst::GenericFormattedValue::from(position),
+                gst::SeekType::Set,
+                gst::ClockTime::NONE,
+            )?,
+            Position::Frame(_) => self.source.seek(
+                self.speed,
+                gst::SeekFlags::FLUSH
+                    | if accurate {
+                        gst::SeekFlags::ACCURATE
+                    } else {
+                        gst::SeekFlags::empty()
+                    },
+                gst::SeekType::Set,
+                gst::GenericFormattedValue::from(position),
+                gst::SeekType::Set,
+                gst::format::Default::NONE,
+            )?,
+        };
 
-        // Clear subtitles immediately
         *self.subtitle_text.lock().expect("lock subtitle_text") = None;
         self.upload_text.store(true, Ordering::SeqCst);
-
-        // Clone the source pipeline for the background thread
-        let source_clone = self.source.clone();
-        let speed = self.speed;
-
-        // Spawn a background thread to perform the seek without blocking the main thread
-        std::thread::spawn(move || {
-            // Perform the seek operation in the background thread
-            // gstreamer complains if the start & end value types aren't the same
-            let seek_result = match &position {
-                Position::Time(_) => source_clone.seek(
-                    speed,
-                    seek_flags,
-                    gst::SeekType::Set,
-                    gst::GenericFormattedValue::from(position),
-                    gst::SeekType::Set,
-                    gst::ClockTime::NONE,
-                ),
-                Position::Frame(_) => source_clone.seek(
-                    speed,
-                    seek_flags,
-                    gst::SeekType::Set,
-                    gst::GenericFormattedValue::from(position),
-                    gst::SeekType::Set,
-                    gst::format::Default::NONE,
-                ),
-            };
-
-            if let Err(e) = seek_result {
-                log::warn!("seek operation failed in background thread: {:?}", e);
-            }
-        });
 
         Ok(())
     }
@@ -160,11 +139,10 @@ impl Internal {
         let Some(position) = self.source.query_position::<gst::ClockTime>() else {
             return Err(Error::Caps);
         };
-        // NOTE: Not using FLUSH flag to avoid deadlock with concurrent seeks
         if speed > 0.0 {
             self.source.seek(
                 speed,
-                gst::SeekFlags::ACCURATE,
+                gst::SeekFlags::FLUSH | gst::SeekFlags::ACCURATE,
                 gst::SeekType::Set,
                 position,
                 gst::SeekType::End,
@@ -173,7 +151,7 @@ impl Internal {
         } else {
             self.source.seek(
                 speed,
-                gst::SeekFlags::ACCURATE,
+                gst::SeekFlags::FLUSH | gst::SeekFlags::ACCURATE,
                 gst::SeekType::Set,
                 gst::ClockTime::from_seconds(0),
                 gst::SeekType::Set,
@@ -192,23 +170,13 @@ impl Internal {
     }
 
     pub(crate) fn set_paused(&mut self, paused: bool) {
-        // IMPORTANT: Calling set_state() from the main thread on macOS causes deadlock with
-        // GStreamer's OSX audio sink when it tries to acquire CoreAudio HALB_Mutex.
-        // Solution: Move the state change to a background thread to allow the main thread
-        // to continue without blocking on GStreamer's mutex operations.
-
-        // Track the intended paused state ATOMICALLY so the worker thread can also check it.
-        // This ensures both main thread and worker thread see the same state during transitions.
-        self.intended_paused.store(paused, Ordering::SeqCst);
-
-        let source_clone = self.source.clone();
-        std::thread::spawn(move || {
-            let _ = source_clone.set_state(if paused {
+        self.source
+            .set_state(if paused {
                 gst::State::Paused
             } else {
                 gst::State::Playing
-            });
-        });
+            })
+            .unwrap(/* state was changed in ctor; state errors caught there */);
 
         // Set restart_stream flag to make the stream restart on the next Message::NextFrame
         if self.is_eos && !paused {
@@ -217,11 +185,7 @@ impl Internal {
     }
 
     pub(crate) fn paused(&self) -> bool {
-        // Return the LOCAL intended paused state instead of querying GStreamer.
-        // This avoids race conditions where the background thread might still be
-        // applying the state change. The intended_paused field is set BEFORE
-        // spawning the background thread that calls set_state().
-        self.intended_paused.load(Ordering::SeqCst)
+        self.source.state(gst::ClockTime::ZERO).1 == gst::State::Paused
     }
 
     /// Syncs audio with video when there is (inevitably) latency presenting the frame.
@@ -321,13 +285,6 @@ impl Video {
 
         let pad = video_sink.pads().first().cloned().unwrap();
 
-        // Mute and set volume to 0 before entering Playing state to prevent audio burst on load
-        pipeline.set_property("mute", true);
-        pipeline.set_property("volume", 0.0);
-
-        // Set to Playing state for immediate playback
-        // Concurrent FLUSH_START deadlocks during looping are prevented by serializing
-        // seek operations in the app-level synchronization lock
         cleanup!(pipeline.set_state(gst::State::Playing))?;
 
         // wait for up to 5 seconds until the decoder gets the source capabilities
@@ -336,9 +293,7 @@ impl Video {
         // extract resolution and framerate
         // TODO(jazzfool): maybe we want to extract some other information too?
         let caps = cleanup!(pad.current_caps().ok_or(Error::Caps))?;
-        log::debug!("Negotiated caps: {}", caps.to_string());
         let s = cleanup!(caps.structure(0).ok_or(Error::Caps))?;
-
         let width = cleanup!(s.get::<i32>("width").map_err(|_| Error::Caps))?;
         let height = cleanup!(s.get::<i32>("height").map_err(|_| Error::Caps))?;
         // resolution should be mod4
@@ -380,25 +335,21 @@ impl Video {
         let subtitle_text_ref = Arc::clone(&subtitle_text);
         let upload_text_ref = Arc::clone(&upload_text);
 
-        // Track intended paused state atomically for synchronization with worker thread
-        let intended_paused = Arc::new(AtomicBool::new(false));
-        let intended_paused_ref = Arc::clone(&intended_paused);
+        let pipeline_ref = pipeline.clone();
 
         let worker = std::thread::spawn(move || {
             let mut clear_subtitles_at = None;
 
             while alive_ref.load(Ordering::Acquire) {
-                match (|| -> Result<(), gst::FlowError> {
-                    // Use intended_paused state instead of querying GStreamer to ensure
-                    // synchronization with main thread during async state transitions
+                if let Err(gst::FlowError::Error) = (|| -> Result<(), gst::FlowError> {
                     let sample =
-                        if intended_paused_ref.load(Ordering::SeqCst) {
+                        if pipeline_ref.state(gst::ClockTime::ZERO).1 != gst::State::Playing {
                             video_sink
-                                .try_pull_preroll(gst::ClockTime::from_mseconds(50))
+                                .try_pull_preroll(gst::ClockTime::from_mseconds(16))
                                 .ok_or(gst::FlowError::Eos)?
                         } else {
                             video_sink
-                                .try_pull_sample(gst::ClockTime::from_mseconds(50))
+                                .try_pull_sample(gst::ClockTime::from_mseconds(16))
                                 .ok_or(gst::FlowError::Eos)?
                         };
 
@@ -469,21 +420,7 @@ impl Video {
 
                     Ok(())
                 })() {
-                    Ok(()) => {
-                        // Frame pulled successfully, continue
-                    }
-                    Err(gst::FlowError::Eos) => {
-                        // End of stream reached. Sleep briefly to allow GStreamer's looping
-                        // mechanism to restart the video. This prevents busy-waiting when video loops.
-                        std::thread::sleep(std::time::Duration::from_millis(10));
-                    }
-                    Err(gst::FlowError::Error) => {
-                        log::error!("error pulling frame");
-                    }
-                    Err(other) => {
-                        log::warn!("unexpected flow error: {:?}", other);
-                        std::thread::sleep(std::time::Duration::from_millis(10));
-                    }
+                    log::error!("error pulling frame");
                 }
             }
         });
@@ -514,8 +451,6 @@ impl Video {
 
             subtitle_text,
             upload_text,
-
-            intended_paused,
         })))
     }
 
@@ -546,14 +481,8 @@ impl Video {
     ///
     /// This uses a linear scale, for example `0.5` is perceived as half as loud.
     pub fn set_volume(&mut self, volume: f64) {
-        // CRITICAL FIX: Removed set_muted() call that was causing CoreAudio deadlocks.
-        // The original comment suggested GStreamer unmutes when changing volume, but calling
-        // set_muted() (which does set_property("mute")) on every volume change triggers the
-        // HALB_Mutex deadlock in CoreAudio when multiple videos try to adjust volume concurrently.
-        // This is especially critical during rapid mute/unmute sequences (switching audio between videos).
-        // If GStreamer auto-unmutes on volume change, that's acceptable - users can see video with audio,
-        // but deadlock prevention is more important.
         self.get_mut().source.set_property("volume", volume);
+        self.set_muted(self.muted()); // for some reason gstreamer unmutes when changing volume?
     }
 
     /// Get the volume multiplier of the audio.
@@ -714,7 +643,13 @@ impl Video {
     }
 }
 
-fn yuv_to_rgba(yuv: &[u8], width: u32, height: u32, downscale: u32, stride: Option<u32>) -> Vec<u8> {
+fn yuv_to_rgba(
+    yuv: &[u8],
+    width: u32,
+    height: u32,
+    downscale: u32,
+    stride: Option<u32>,
+) -> Vec<u8> {
     // Use stride from VideoMeta if available, otherwise assume stride == width
     let stride = stride.unwrap_or(width);
 
