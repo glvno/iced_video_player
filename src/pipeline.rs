@@ -428,15 +428,21 @@ impl Primitive for VideoPrimitive {
         let pipeline = storage.get_mut::<VideoPipeline>().unwrap();
 
         if self.upload_frame {
-            let stride = self.frame.lock().expect("lock frame mutex").stride();
-            if let Some(readable) = self.frame.lock().expect("lock frame mutex").readable() {
+            let (stride, maybe_readable) = {
+                let frame_guard = self.frame.lock().expect("lock frame mutex");
+                let stride = frame_guard.stride();
+                let readable = frame_guard.readable();
+                (stride, readable.map(|r| r.as_slice().to_vec()))
+            };
+
+            if let Some(readable_data) = maybe_readable {
                 pipeline.upload(
                     device,
                     queue,
                     self.video_id,
                     &self.alive,
                     self.size,
-                    readable.as_slice(),
+                    &readable_data,
                     stride,
                 );
             }
