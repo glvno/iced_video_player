@@ -226,7 +226,11 @@ where
         let mut inner = self.video.write();
 
         if let iced::Event::Window(iced::window::Event::RedrawRequested(_)) = event {
-            if inner.restart_stream || (!inner.is_eos && !inner.paused()) {
+            let is_eos = inner.is_eos_atomic.load(Ordering::SeqCst);
+            let is_paused = inner.is_paused.load(Ordering::SeqCst);
+            let is_looping = inner.is_looping.load(Ordering::SeqCst);
+
+            if inner.restart_stream || (!is_eos && !is_paused) {
                 let mut restart_stream = false;
                 let emit_eos = !inner.restart_stream;
                 if inner.restart_stream {
@@ -253,7 +257,7 @@ where
                             {
                                 shell.publish(on_end_of_stream);
                             }
-                            if inner.looping {
+                            if is_looping {
                                 restart_stream = true;
                             } else {
                                 eos_pause = true;
@@ -269,7 +273,7 @@ where
                         error!("cannot restart stream (can't seek): {err:#?}");
                     }
                 } else if eos_pause {
-                    inner.is_eos = true;
+                    inner.is_eos_atomic.store(true, Ordering::SeqCst);
                     inner.set_paused(true);
                 }
 

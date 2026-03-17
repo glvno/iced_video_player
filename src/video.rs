@@ -84,14 +84,26 @@ pub(crate) struct Internal {
     pub(crate) frame: Arc<Mutex<Frame>>,
     pub(crate) upload_frame: Arc<AtomicBool>,
     pub(crate) last_frame_time: Arc<Mutex<Instant>>,
-    pub(crate) looping: bool,
-    pub(crate) is_eos: bool,
     pub(crate) restart_stream: bool,
     pub(crate) sync_av_avg: u64,
     pub(crate) sync_av_counter: u64,
 
     pub(crate) subtitle_text: Arc<Mutex<Option<String>>>,
     pub(crate) upload_text: Arc<AtomicBool>,
+
+    // Atomic state — readable without locking
+    pub(crate) is_paused: Arc<AtomicBool>,
+    pub(crate) is_looping: Arc<AtomicBool>,
+    pub(crate) is_muted: Arc<AtomicBool>,
+    pub(crate) is_eos_atomic: Arc<AtomicBool>,
+    /// Cached position in nanoseconds, updated by worker thread at ~60Hz.
+    pub(crate) cached_position_ns: Arc<AtomicU64>,
+    /// Timestamp (as nanos since UNIX_EPOCH) of last position value change.
+    pub(crate) last_position_change_ns: Arc<AtomicU64>,
+    /// Whether the duration was estimated/corrected rather than queried from GStreamer.
+    pub(crate) duration_estimated: AtomicBool,
+    /// Whether audio is enabled (real sink) or disabled (fakesink).
+    pub(crate) audio_enabled: AtomicBool,
 }
 
 impl Internal {
@@ -162,7 +174,7 @@ impl Internal {
     }
 
     pub(crate) fn restart_stream(&mut self) -> Result<(), Error> {
-        self.is_eos = false;
+        self.is_eos_atomic.store(false, Ordering::SeqCst);
         self.set_paused(false);
         self.seek(0, false)?;
         Ok(())
@@ -177,14 +189,12 @@ impl Internal {
             })
             .unwrap(/* state was changed in ctor; state errors caught there */);
 
+        self.is_paused.store(paused, Ordering::SeqCst);
+
         // Set restart_stream flag to make the stream restart on the next Message::NextFrame
-        if self.is_eos && !paused {
+        if self.is_eos_atomic.load(Ordering::SeqCst) && !paused {
             self.restart_stream = true;
         }
-    }
-
-    pub(crate) fn paused(&self) -> bool {
-        self.source.state(gst::ClockTime::ZERO).1 == gst::State::Paused
     }
 
     /// Syncs audio with video when there is (inevitably) latency presenting the frame.
@@ -205,35 +215,38 @@ impl Internal {
 #[derive(Debug)]
 pub struct Video(pub(crate) RwLock<Internal>);
 
+// Non-blocking Drop — pipeline teardown happens on a detached thread.
 impl Drop for Video {
     fn drop(&mut self) {
         let inner = self.0.get_mut().expect("failed to lock");
-
-        inner
-            .source
-            .set_state(gst::State::Null)
-            .expect("failed to set state");
-
         inner.alive.store(false, Ordering::SeqCst);
-        if let Some(worker) = inner.worker.take()
-            && let Err(err) = worker.join()
-        {
-            match err.downcast_ref::<String>() {
-                Some(e) => log::error!("Video thread panicked: {e}"),
-                None => log::error!("Video thread panicked with unknown reason"),
-            }
-        }
+        let pipeline = inner.source.clone();
+        let worker = inner.worker.take();
+        std::thread::Builder::new()
+            .name("video-cleanup".into())
+            .spawn(move || {
+                let _ = pipeline.set_state(gst::State::Null);
+                if let Some(w) = worker {
+                    let _ = w.join();
+                }
+            })
+            .ok();
     }
 }
 
 impl Video {
     /// Create a new video player from a given video which loads from `uri`.
+    /// Audio starts disabled (fakesink) to avoid CoreAudio contention.
+    /// Call `set_audio_enabled(true)` to enable real audio output.
     /// Note that live sources will report the duration to be zero.
     pub fn new(uri: &url::Url) -> Result<Self, Error> {
         gst::init()?;
 
         let pipeline = format!(
-            "playbin uri=\"{}\" text-sink=\"appsink name=iced_text sync=true drop=true\" video-sink=\"videoscale ! videoconvert ! appsink name=iced_video drop=true caps=video/x-raw,format=NV12,pixel-aspect-ratio=1/1\"",
+            "playbin uri=\"{}\" audio-sink=fakesink \
+             text-sink=\"appsink name=iced_text sync=true drop=true\" \
+             video-sink=\"videoscale ! videoconvert ! appsink name=iced_video drop=true \
+             caps=video/x-raw,format=NV12,pixel-aspect-ratio=1/1\"",
             uri.as_str()
         );
         let pipeline = gst::parse::launch(pipeline.as_ref())?
@@ -293,7 +306,6 @@ impl Video {
         cleanup!(pipeline.state(gst::ClockTime::from_seconds(5)).0)?;
 
         // extract resolution and framerate
-        // TODO(jazzfool): maybe we want to extract some other information too?
         let caps = cleanup!(pad.current_caps().ok_or(Error::Caps))?;
         let s = cleanup!(caps.structure(0).ok_or(Error::Caps))?;
         let width = cleanup!(s.get::<i32>("width").map_err(|_| Error::Caps))?;
@@ -310,14 +322,30 @@ impl Video {
             return Err(Error::Framerate(framerate));
         }
 
-        let duration = Duration::from_nanos(
-            pipeline
-                .query_duration::<gst::ClockTime>()
-                .map(|duration| duration.nseconds())
-                .unwrap_or(0),
-        );
+        // Duration validation
+        let raw_duration_ns = pipeline
+            .query_duration::<gst::ClockTime>()
+            .map(|d| d.nseconds())
+            .unwrap_or(0);
+        let (duration, duration_estimated) = if raw_duration_ns > 0 {
+            (Duration::from_nanos(raw_duration_ns), false)
+        } else {
+            log::warn!("Duration query returned 0, will estimate from playback");
+            (Duration::from_secs(0), true)
+        };
 
         let sync_av = pipeline.has_property("av-offset", None);
+
+        // Detect if audio is using fakesink (disabled) by checking audio-sink property
+        let audio_enabled = if pipeline.has_property("audio-sink", None) {
+            let audio_sink: Option<gst::Element> = pipeline.property("audio-sink");
+            audio_sink
+                .as_ref()
+                .map(|s| s.factory().map(|f| f.name() != "fakesink").unwrap_or(true))
+                .unwrap_or(true)
+        } else {
+            true
+        };
 
         // NV12 = 12bpp
         let frame = Arc::new(Mutex::new(Frame::empty()));
@@ -335,10 +363,17 @@ impl Video {
         let subtitle_text_ref = Arc::clone(&subtitle_text);
         let upload_text_ref = Arc::clone(&upload_text);
 
+        // Background position tracking
+        let cached_position_ns = Arc::new(AtomicU64::new(0));
+        let cached_position_ns_ref = Arc::clone(&cached_position_ns);
+        let last_position_change_ns = Arc::new(AtomicU64::new(0));
+        let last_position_change_ns_ref = Arc::clone(&last_position_change_ns);
+
         let pipeline_ref = pipeline.clone();
 
         let worker = std::thread::spawn(move || {
             let mut clear_subtitles_at = None;
+            let mut last_position_value: u64 = 0;
 
             while alive_ref.load(Ordering::Acquire) {
                 if let Err(gst::FlowError::Error) = (|| -> Result<(), gst::FlowError> {
@@ -368,6 +403,30 @@ impl Video {
                     }
 
                     upload_frame_ref.swap(true, Ordering::SeqCst);
+
+                    // Update cached position from worker thread
+                    if let Some(pos) = pipeline_ref.query_position::<gst::ClockTime>() {
+                        let pos_ns = pos.nseconds();
+                        cached_position_ns_ref.store(pos_ns, Ordering::Relaxed);
+
+                        // Track when position actually changes (for stall detection)
+                        let diff = if pos_ns > last_position_value {
+                            pos_ns - last_position_value
+                        } else {
+                            last_position_value - pos_ns
+                        };
+                        // ~10ms threshold in nanoseconds
+                        if diff > 10_000_000 {
+                            last_position_value = pos_ns;
+                            last_position_change_ns_ref.store(
+                                std::time::SystemTime::now()
+                                    .duration_since(std::time::UNIX_EPOCH)
+                                    .unwrap_or_default()
+                                    .as_nanos() as u64,
+                                Ordering::Relaxed,
+                            );
+                        }
+                    }
 
                     if let Some(at) = clear_subtitles_at
                         && frame_pts >= at
@@ -425,6 +484,13 @@ impl Video {
             }
         });
 
+        // Detect initial muted state from pipeline
+        let is_muted = if pipeline.has_property("mute", None) {
+            pipeline.property::<bool>("mute")
+        } else {
+            false
+        };
+
         Ok(Video(RwLock::new(Internal {
             id,
 
@@ -443,14 +509,23 @@ impl Video {
             frame,
             upload_frame,
             last_frame_time,
-            looping: false,
-            is_eos: false,
             restart_stream: false,
             sync_av_avg: 0,
             sync_av_counter: 0,
 
             subtitle_text,
             upload_text,
+
+            is_paused: Arc::new(AtomicBool::new(false)),
+            is_looping: Arc::new(AtomicBool::new(false)),
+            is_muted: Arc::new(AtomicBool::new(is_muted)),
+            is_eos_atomic: Arc::new(AtomicBool::new(false)),
+
+            cached_position_ns,
+            last_position_change_ns,
+
+            duration_estimated: AtomicBool::new(duration_estimated),
+            audio_enabled: AtomicBool::new(audio_enabled),
         })))
     }
 
@@ -468,7 +543,8 @@ impl Video {
 
     /// Get the size/resolution of the video as `(width, height)`.
     pub fn size(&self) -> (i32, i32) {
-        (self.read().width, self.read().height)
+        let inner = self.read();
+        (inner.width, inner.height)
     }
 
     /// Get the framerate of the video as frames per second.
@@ -480,9 +556,12 @@ impl Video {
     /// `0.0` = 0% volume, `1.0` = 100% volume.
     ///
     /// This uses a linear scale, for example `0.5` is perceived as half as loud.
-    pub fn set_volume(&mut self, volume: f64) {
-        self.get_mut().source.set_property("volume", volume);
-        self.set_muted(self.muted()); // for some reason gstreamer unmutes when changing volume?
+    pub fn set_volume(&self, volume: f64) {
+        let inner = self.write();
+        inner.source.set_property("volume", volume);
+        // GStreamer sometimes unmutes when changing volume, re-apply mute state
+        let muted = inner.is_muted.load(Ordering::SeqCst);
+        inner.source.set_property("mute", muted);
     }
 
     /// Get the volume multiplier of the audio.
@@ -491,45 +570,47 @@ impl Video {
     }
 
     /// Set if the audio is muted or not, without changing the volume.
-    pub fn set_muted(&mut self, muted: bool) {
-        self.get_mut().source.set_property("mute", muted);
+    pub fn set_muted(&self, muted: bool) {
+        let inner = self.write();
+        inner.source.set_property("mute", muted);
+        inner.is_muted.store(muted, Ordering::SeqCst);
     }
 
     /// Get if the audio is muted or not.
     pub fn muted(&self) -> bool {
-        self.read().source.property("mute")
+        self.read().is_muted.load(Ordering::SeqCst)
     }
 
     /// Get if the stream ended or not.
     pub fn eos(&self) -> bool {
-        self.read().is_eos
+        self.read().is_eos_atomic.load(Ordering::SeqCst)
     }
 
     /// Get if the media will loop or not.
     pub fn looping(&self) -> bool {
-        self.read().looping
+        self.read().is_looping.load(Ordering::SeqCst)
     }
 
     /// Set if the media will loop or not.
-    pub fn set_looping(&mut self, looping: bool) {
-        self.get_mut().looping = looping;
+    pub fn set_looping(&self, looping: bool) {
+        self.read().is_looping.store(looping, Ordering::SeqCst);
     }
 
     /// Set if the media is paused or not.
-    pub fn set_paused(&mut self, paused: bool) {
-        self.get_mut().set_paused(paused)
+    pub fn set_paused(&self, paused: bool) {
+        self.write().set_paused(paused)
     }
 
     /// Get if the media is paused or not.
     pub fn paused(&self) -> bool {
-        self.read().paused()
+        self.read().is_paused.load(Ordering::SeqCst)
     }
 
     /// Jumps to a specific position in the media.
     /// Passing `true` to the `accurate` parameter will result in more accurate seeking,
     /// however, it is also slower. For most seeks (e.g., scrubbing) this is not needed.
-    pub fn seek(&mut self, position: impl Into<Position>, accurate: bool) -> Result<(), Error> {
-        self.get_mut().seek(position, accurate)
+    pub fn seek(&self, position: impl Into<Position>, accurate: bool) -> Result<(), Error> {
+        self.read().seek(position, accurate)
     }
 
     /// Set the playback speed of the media.
@@ -544,6 +625,10 @@ impl Video {
     }
 
     /// Get the current playback position in time.
+    ///
+    /// **Warning**: This queries GStreamer directly and may block on macOS
+    /// when CoreAudio mutex is contended. Prefer [`cached_position`](Video::cached_position)
+    /// for non-blocking reads.
     pub fn position(&self) -> Duration {
         Duration::from_nanos(
             self.read()
@@ -561,14 +646,123 @@ impl Video {
             .map_or(0, |pos| pos.into())
     }
 
+    /// Get the current playback position without blocking.
+    /// Updated by the worker thread at ~60Hz. May lag by up to ~16ms.
+    pub fn cached_position(&self) -> Duration {
+        Duration::from_nanos(self.read().cached_position_ns.load(Ordering::Relaxed))
+    }
+
+    /// Get the time elapsed since the playback position last changed.
+    /// Useful for stall detection — if this exceeds a few seconds while
+    /// the video is playing, the pipeline is likely stuck.
+    pub fn time_since_position_change(&self) -> Duration {
+        let stored_ns = self.read().last_position_change_ns.load(Ordering::Relaxed);
+        if stored_ns == 0 {
+            return Duration::from_secs(0);
+        }
+        let now_ns = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos() as u64;
+        Duration::from_nanos(now_ns.saturating_sub(stored_ns))
+    }
+
     /// Get the media duration.
     pub fn duration(&self) -> Duration {
         self.read().duration
     }
 
+    /// Set the media duration (for external correction when GStreamer reports incorrectly).
+    pub fn set_duration(&self, duration: Duration) {
+        self.write().duration = duration;
+    }
+
+    /// Whether the duration was estimated rather than accurately queried from GStreamer.
+    pub fn duration_estimated(&self) -> bool {
+        self.read().duration_estimated.load(Ordering::SeqCst)
+    }
+
     /// Restarts a stream; seeks to the first frame and unpauses, sets the `eos` flag to false.
     pub fn restart_stream(&mut self) -> Result<(), Error> {
         self.get_mut().restart_stream()
+    }
+
+    /// Check if real audio output is enabled.
+    /// When disabled, audio goes to fakesink (no CoreAudio interaction).
+    pub fn audio_enabled(&self) -> bool {
+        self.read().audio_enabled.load(Ordering::SeqCst)
+    }
+
+    /// Enable or disable real audio output.
+    ///
+    /// When disabled, the audio sink is swapped to `fakesink`, eliminating
+    /// CoreAudio mutex contention. When enabled, swaps to `autoaudiosink`.
+    ///
+    /// This briefly transitions the pipeline through Ready state, causing a
+    /// short playback glitch. Position and playback state are preserved.
+    pub fn set_audio_enabled(&self, enabled: bool) -> Result<(), Error> {
+        let inner = self.write();
+        let current = inner.audio_enabled.load(Ordering::SeqCst);
+        if current == enabled {
+            return Ok(());
+        }
+
+        let position_ns = inner.cached_position_ns.load(Ordering::Relaxed);
+        let was_paused = inner.is_paused.load(Ordering::SeqCst);
+        log::info!(
+            "Audio sink swap: video_id={}, enabled={}, pos={:.2}s",
+            inner.id,
+            enabled,
+            position_ns as f64 / 1_000_000_000.0
+        );
+
+        // Transition to Ready to allow audio sink property change
+        inner.source.set_state(gst::State::Ready)?;
+
+        if enabled {
+            let real_sink = gst::ElementFactory::make("autoaudiosink")
+                .build()
+                .map_err(|_| Error::Cast)?;
+            inner.source.set_property("audio-sink", &real_sink);
+            inner.source.set_property("mute", false);
+            inner.source.set_property("volume", 1.0f64);
+            inner.is_muted.store(false, Ordering::SeqCst);
+        } else {
+            let fakesink = gst::ElementFactory::make("fakesink")
+                .build()
+                .map_err(|_| Error::Cast)?;
+            inner.source.set_property("audio-sink", &fakesink);
+            inner.source.set_property("mute", true);
+            inner.source.set_property("volume", 0.0f64);
+            inner.is_muted.store(true, Ordering::SeqCst);
+        }
+
+        // Resume playback
+        inner.source.set_state(gst::State::Playing)?;
+
+        // When enabling real audio, wait for sink to initialize
+        if enabled {
+            let _ = inner.source.state(gst::ClockTime::from_seconds(2));
+        }
+
+        inner.audio_enabled.store(enabled, Ordering::SeqCst);
+
+        if was_paused {
+            inner.source.set_state(gst::State::Paused)?;
+        }
+
+        // Seek back to position
+        if position_ns > 0 {
+            inner.seek(Duration::from_nanos(position_ns), false)?;
+        }
+
+        log::info!(
+            "Audio sink swap complete: video_id={}, enabled={}",
+            inner.id,
+            enabled
+        );
+
+        Ok(())
     }
 
     /// Set the subtitle URL to display.
