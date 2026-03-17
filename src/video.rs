@@ -98,10 +98,12 @@ pub(crate) struct Internal {
     pub(crate) is_eos_atomic: Arc<AtomicBool>,
     /// Cached position in nanoseconds, updated by worker thread at ~60Hz.
     pub(crate) cached_position_ns: Arc<AtomicU64>,
+    /// Cached duration in nanoseconds, updated by worker thread when duration_estimated is true.
+    pub(crate) cached_duration_ns: Arc<AtomicU64>,
     /// Timestamp (as nanos since UNIX_EPOCH) of last position value change.
     pub(crate) last_position_change_ns: Arc<AtomicU64>,
     /// Whether the duration was estimated/corrected rather than queried from GStreamer.
-    pub(crate) duration_estimated: AtomicBool,
+    pub(crate) duration_estimated: Arc<AtomicBool>,
     /// Whether audio is enabled (real sink) or disabled (fakesink).
     pub(crate) audio_enabled: AtomicBool,
 }
@@ -176,7 +178,7 @@ impl Internal {
     pub(crate) fn restart_stream(&mut self) -> Result<(), Error> {
         self.is_eos_atomic.store(false, Ordering::SeqCst);
         self.set_paused(false);
-        self.seek(0, false)?;
+        self.seek(Duration::from_secs(0), false)?;
         Ok(())
     }
 
@@ -363,9 +365,13 @@ impl Video {
         let subtitle_text_ref = Arc::clone(&subtitle_text);
         let upload_text_ref = Arc::clone(&upload_text);
 
-        // Background position tracking
+        // Background position/duration tracking
         let cached_position_ns = Arc::new(AtomicU64::new(0));
         let cached_position_ns_ref = Arc::clone(&cached_position_ns);
+        let cached_duration_ns = Arc::new(AtomicU64::new(raw_duration_ns));
+        let cached_duration_ns_ref = Arc::clone(&cached_duration_ns);
+        let duration_estimated_ref = Arc::new(AtomicBool::new(duration_estimated));
+        let duration_estimated_worker = Arc::clone(&duration_estimated_ref);
         let last_position_change_ns = Arc::new(AtomicU64::new(0));
         let last_position_change_ns_ref = Arc::clone(&last_position_change_ns);
 
@@ -376,6 +382,18 @@ impl Video {
             let mut last_position_value: u64 = 0;
 
             while alive_ref.load(Ordering::Acquire) {
+                // Re-query duration when it was estimated (not available at init)
+                if duration_estimated_worker.load(Ordering::Relaxed) {
+                    if let Some(dur) = pipeline_ref.query_duration::<gst::ClockTime>() {
+                        let dur_ns = dur.nseconds();
+                        if dur_ns > 0 {
+                            cached_duration_ns_ref.store(dur_ns, Ordering::Relaxed);
+                            duration_estimated_worker.store(false, Ordering::Relaxed);
+                        }
+                    }
+                }
+
+                // Try to pull a video frame
                 if let Err(gst::FlowError::Error) = (|| -> Result<(), gst::FlowError> {
                     let sample =
                         if pipeline_ref.state(gst::ClockTime::ZERO).1 != gst::State::Playing {
@@ -404,28 +422,28 @@ impl Video {
 
                     upload_frame_ref.swap(true, Ordering::SeqCst);
 
-                    // Update cached position from worker thread
-                    if let Some(pos) = pipeline_ref.query_position::<gst::ClockTime>() {
-                        let pos_ns = pos.nseconds();
-                        cached_position_ns_ref.store(pos_ns, Ordering::Relaxed);
+                    // Use the frame PTS as position — this is reliable across
+                    // loop restarts, unlike query_position which returns stale
+                    // EOS values after seek.
+                    let pos_ns = frame_pts.nseconds();
+                    cached_position_ns_ref.store(pos_ns, Ordering::Relaxed);
 
-                        // Track when position actually changes (for stall detection)
-                        let diff = if pos_ns > last_position_value {
-                            pos_ns - last_position_value
-                        } else {
-                            last_position_value - pos_ns
-                        };
-                        // ~10ms threshold in nanoseconds
-                        if diff > 10_000_000 {
-                            last_position_value = pos_ns;
-                            last_position_change_ns_ref.store(
-                                std::time::SystemTime::now()
-                                    .duration_since(std::time::UNIX_EPOCH)
-                                    .unwrap_or_default()
-                                    .as_nanos() as u64,
-                                Ordering::Relaxed,
-                            );
-                        }
+                    // Track when position actually changes (for stall detection)
+                    let diff = if pos_ns > last_position_value {
+                        pos_ns - last_position_value
+                    } else {
+                        last_position_value - pos_ns
+                    };
+                    // ~10ms threshold in nanoseconds
+                    if diff > 10_000_000 {
+                        last_position_value = pos_ns;
+                        last_position_change_ns_ref.store(
+                            std::time::SystemTime::now()
+                                .duration_since(std::time::UNIX_EPOCH)
+                                .unwrap_or_default()
+                                .as_nanos() as u64,
+                            Ordering::Relaxed,
+                        );
                     }
 
                     if let Some(at) = clear_subtitles_at
@@ -522,9 +540,10 @@ impl Video {
             is_eos_atomic: Arc::new(AtomicBool::new(false)),
 
             cached_position_ns,
+            cached_duration_ns,
             last_position_change_ns,
 
-            duration_estimated: AtomicBool::new(duration_estimated),
+            duration_estimated: duration_estimated_ref,
             audio_enabled: AtomicBool::new(audio_enabled),
         })))
     }
@@ -650,6 +669,13 @@ impl Video {
     /// Updated by the worker thread at ~60Hz. May lag by up to ~16ms.
     pub fn cached_position(&self) -> Duration {
         Duration::from_nanos(self.read().cached_position_ns.load(Ordering::Relaxed))
+    }
+
+    /// Get the media duration without blocking.
+    /// Updated by the worker thread when the initial duration query failed.
+    /// Returns Duration::ZERO if duration is not yet known.
+    pub fn cached_duration(&self) -> Duration {
+        Duration::from_nanos(self.read().cached_duration_ns.load(Ordering::Relaxed))
     }
 
     /// Get the time elapsed since the playback position last changed.
