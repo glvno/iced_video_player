@@ -16,6 +16,7 @@ where
 {
     video: &'a Video,
     content_fit: iced::ContentFit,
+    pan: iced::Vector,
     width: iced::Length,
     height: iced::Length,
     on_end_of_stream: Option<Message>,
@@ -34,6 +35,7 @@ where
         VideoPlayer {
             video,
             content_fit: iced::ContentFit::default(),
+            pan: iced::Vector::ZERO,
             width: iced::Length::Shrink,
             height: iced::Length::Shrink,
             on_end_of_stream: None,
@@ -66,6 +68,16 @@ where
             content_fit,
             ..self
         }
+    }
+
+    /// Offsets the drawn frame within the widget bounds, in screen pixels.
+    ///
+    /// Only has a visible effect where the frame overflows the bounds, such as
+    /// with [`iced::ContentFit::Cover`]. The offset is clamped to the available
+    /// overflow on each axis, so the frame can never be pulled far enough to
+    /// expose a gap; an axis with no overflow ignores the offset entirely.
+    pub fn pan(self, pan: iced::Vector) -> Self {
+        VideoPlayer { pan, ..self }
     }
 
     /// Message to send when the video reaches the end of stream (i.e., the video ends).
@@ -179,7 +191,18 @@ where
             ),
         };
 
-        let drawing_bounds = iced::Rectangle::new(position, final_size);
+        // Clamp the pan to the overflow so the frame always covers the bounds.
+        // An axis that does not overflow has a zero range and stays centered.
+        let max_pan = iced::Vector::new(
+            ((final_size.width - bounds.width) / 2.0).max(0.0),
+            ((final_size.height - bounds.height) / 2.0).max(0.0),
+        );
+        let pan = iced::Vector::new(
+            self.pan.x.clamp(-max_pan.x, max_pan.x),
+            self.pan.y.clamp(-max_pan.y, max_pan.y),
+        );
+
+        let drawing_bounds = iced::Rectangle::new(position + pan, final_size);
 
         let upload_frame = inner.upload_frame.swap(false, Ordering::SeqCst);
 
